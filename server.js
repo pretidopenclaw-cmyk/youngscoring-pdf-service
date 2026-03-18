@@ -53,11 +53,12 @@ app.post("/generate", async (req, res) => {
     await browser.close();
     browser = null;
 
+    const pdfBuffer = Buffer.from(pdf);
     res.set({
       "Content-Type": "application/pdf",
-      "Content-Length": pdf.length,
+      "Content-Length": pdfBuffer.length,
     });
-    res.send(pdf);
+    res.end(pdfBuffer);
   } catch (err) {
     console.error("[PDF] Error:", err.message);
     if (browser) await browser.close().catch(() => {});
