@@ -9,9 +9,62 @@ const API_KEY = process.env.API_KEY || "ys-pdf-secret-key-2026";
 app.use(express.json({ limit: "5mb" }));
 app.use(express.text({ limit: "5mb", type: "text/html" }));
 
-// Health check
+// Health check léger — réponse instantanée, ping monitoring
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "youngscoring-pdf-service" });
+});
+
+// Health check profond — lance un vrai render Puppeteer minimal pour vérifier
+// que la chaîne complète fonctionne. Plus lent (~1-3s). À pinger toutes les
+// 15-30 min depuis UptimeRobot/équivalent, pas toutes les 5 min.
+app.get("/healthz", async (req, res) => {
+  const t0 = Date.now();
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+      ],
+    });
+    const page = await browser.newPage();
+    await page.setContent(
+      "<!doctype html><html><body><p>healthz ping</p></body></html>",
+      { waitUntil: "load", timeout: 10000 },
+    );
+    const pdf = await page.pdf({ format: "A4", printBackground: false });
+    await browser.close();
+    browser = null;
+
+    if (!pdf || pdf.length < 500) {
+      return res.status(503).json({
+        status: "degraded",
+        reason: "pdf_too_small",
+        size: pdf?.length || 0,
+        latency_ms: Date.now() - t0,
+      });
+    }
+    res.json({
+      status: "ok",
+      service: "youngscoring-pdf-service",
+      check: "deep",
+      pdf_size: pdf.length,
+      latency_ms: Date.now() - t0,
+    });
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    console.error("[healthz] Error:", err.message);
+    res.status(503).json({
+      status: "degraded",
+      reason: "render_failed",
+      detail: err.message,
+      latency_ms: Date.now() - t0,
+    });
+  }
 });
 
 // Generate PDF from HTML
