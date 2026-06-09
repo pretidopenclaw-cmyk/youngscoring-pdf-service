@@ -9,36 +9,101 @@ const API_KEY = process.env.API_KEY || "ys-pdf-secret-key-2026";
 app.use(express.json({ limit: "5mb" }));
 app.use(express.text({ limit: "5mb", type: "text/html" }));
 
-// Health check léger — réponse instantanée, ping monitoring
+// --- Browser singleton ----------------------------------------------------
+// On garde UNE instance Chrome vivante et on la réutilise entre les requêtes.
+// Lancer un browser par requête épuise les PID/threads du conteneur (EAGAIN
+// sur posix_spawn). On ne ferme que les pages ; le browser reste chaud.
+const LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  // PAS de --single-process : provoque des SIGABRT et l'échec de spawn du
+  // crashpad_handler en conteneur (cf. pptr.dev/troubleshooting).
+];
+
+let browserPromise = null;
+
+// --- Limite de concurrence ------------------------------------------------
+// Chaque render = un onglet Chrome (process renderer + RAM). Sous pic
+// (plusieurs utilisateurs qui génèrent en même temps), on borne le nombre de
+// rendus simultanés pour éviter l'OOM / l'épuisement de process. Les requêtes
+// au-delà de la limite attendent leur tour (FIFO), elles ne sont pas rejetées.
+// Ajuste MAX_CONCURRENT_RENDERS selon la RAM du conteneur Railway.
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_RENDERS || 3);
+let active = 0;
+const waiters = [];
+
+function acquire() {
+  if (active < MAX_CONCURRENT) {
+    active++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => waiters.push(resolve));
+}
+
+function release() {
+  const next = waiters.shift();
+  if (next) {
+    next(); // le slot reste pris, transmis au suivant
+  } else {
+    active--;
+  }
+}
+
+async function getBrowser() {
+  if (browserPromise) {
+    try {
+      const b = await browserPromise;
+      if (b.connected) return b;
+    } catch {
+      // launch précédent a échoué → on relance ci-dessous
+    }
+    browserPromise = null;
+  }
+  browserPromise = puppeteer.launch({ headless: true, args: LAUNCH_ARGS });
+  return browserPromise;
+}
+
+// Rend un PDF : browser réutilisé, un onglet par appel, concurrence bornée.
+async function renderPdf(html, options) {
+  await acquire();
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    try {
+      // waitUntil "load" et PAS "networkidle0" : avec setContent, networkidle*
+      // ne se résout jamais sur Chrome récent (timeout garanti). On attend
+      // ensuite explicitement les polices pour un rendu fidèle.
+      await page.setContent(html, options.setContent);
+      await page.evaluate(() => document.fonts.ready).catch(() => {});
+      return await page.pdf(options.pdf);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } finally {
+    release();
+  }
+}
+
+// Health check léger — réponse instantanée. C'est CELUI-CI que doit pinger
+// le healthcheck Railway (voir railway.toml : healthcheckPath = "/").
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "youngscoring-pdf-service" });
 });
 
-// Health check profond — lance un vrai render Puppeteer minimal pour vérifier
-// que la chaîne complète fonctionne. Plus lent (~1-3s). À pinger toutes les
-// 15-30 min depuis UptimeRobot/équivalent, pas toutes les 5 min.
+// Health check profond — render Puppeteer réel (~1-3 s). À pinger à la main
+// ou depuis UptimeRobot toutes les 15-30 min, JAMAIS comme healthcheck Railway.
 app.get("/healthz", async (req, res) => {
   const t0 = Date.now();
-  let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-      ],
-    });
-    const page = await browser.newPage();
-    await page.setContent(
+    const pdf = await renderPdf(
       "<!doctype html><html><body><p>healthz ping</p></body></html>",
-      { waitUntil: "load", timeout: 10000 },
+      {
+        setContent: { waitUntil: "load", timeout: 10000 },
+        pdf: { format: "A4", printBackground: false },
+      },
     );
-    const pdf = await page.pdf({ format: "A4", printBackground: false });
-    await browser.close();
-    browser = null;
 
     if (!pdf || pdf.length < 500) {
       return res.status(503).json({
@@ -56,7 +121,6 @@ app.get("/healthz", async (req, res) => {
       latency_ms: Date.now() - t0,
     });
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
     console.error("[healthz] Error:", err.message);
     res.status(503).json({
       status: "degraded",
@@ -80,31 +144,16 @@ app.post("/generate", async (req, res) => {
     return res.status(400).json({ error: "html is required" });
   }
 
-  let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-      ],
+    const pdf = await renderPdf(html, {
+      setContent: { waitUntil: "load", timeout: 30000 },
+      pdf: {
+        format: "A4",
+        landscape: landscape || false,
+        printBackground: true,
+        margin: { top: "0", right: "0", bottom: "0", left: "0" },
+      },
     });
-
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
-
-    const pdf = await page.pdf({
-      format: "A4",
-      landscape: landscape || false,
-      printBackground: true,
-      margin: { top: "0", right: "0", bottom: "0", left: "0" },
-    });
-
-    await browser.close();
-    browser = null;
 
     const pdfBuffer = Buffer.from(pdf);
     res.set({
@@ -114,10 +163,24 @@ app.post("/generate", async (req, res) => {
     res.end(pdfBuffer);
   } catch (err) {
     console.error("[PDF] Error:", err.message);
-    if (browser) await browser.close().catch(() => {});
     res.status(500).json({ error: "PDF generation failed", details: err.message });
   }
 });
+
+// Ferme proprement le browser au shutdown (SIGTERM Railway au redéploiement).
+async function shutdown() {
+  if (browserPromise) {
+    try {
+      const b = await browserPromise;
+      await b.close().catch(() => {});
+    } catch {
+      /* noop */
+    }
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 app.listen(PORT, () => {
   console.log(`🖨️  PDF service running on port ${PORT}`);

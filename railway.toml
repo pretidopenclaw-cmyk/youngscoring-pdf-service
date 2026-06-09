@@ -1,0 +1,7 @@
+[deploy]
+# Healthcheck léger : "/" répond instantanément sans lancer Chrome.
+# NE PAS pointer sur "/healthz" (render Puppeteer réel) — pingé toutes les
+# ~15 s par Railway, ça épuise les process du conteneur (EAGAIN / SIGABRT).
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
